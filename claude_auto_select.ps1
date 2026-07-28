@@ -8,6 +8,11 @@
     evaluates their 5-hour and 7-day plan usage windows, recalculates current usage scores,
     and automatically selects and launches the instance with the most remaining capacity.
 
+    Priority Logic:
+    1. Highest 5-hour capacity remaining (lowest 5h activity score 'fh')
+    2. Highest weekly capacity remaining (lowest 7d activity score 'sd') if 5h scores are tied / full
+    3. Longest idle duration if both 5h and 7d scores are tied
+
 .USAGE
     .\claude_auto_select.ps1              # Recalculates usage, selects, and launches best account
     .\claude_auto_select.ps1 -SelectOnly  # Returns best instance object/name without launching
@@ -142,10 +147,10 @@ function Get-BestUsageInstance {
         Get-InstanceUsageStats $inst
     }
 
-    # Rank by:
-    # 1. FhScore ascending (lowest 5-hour activity score)
-    # 2. SdScore ascending (lowest 7-day activity score)
-    # 3. LastActiveMs ascending (longest idle time)
+    # Priority Ranking:
+    # 1. FhScore ascending (highest 5-hour capacity remaining / lowest 5h usage score)
+    # 2. SdScore ascending (highest weekly capacity remaining / lowest 7d usage score if 5h is tied/full)
+    # 3. LastActiveMs ascending (longest idle duration if 5h & 7d are tied)
     $sorted = $allStats | Sort-Object FhScore, SdScore, LastActiveMs
     return $sorted
 }
@@ -175,7 +180,7 @@ Write-Host "`n[+] Selected Instance with Most Usage Remaining: '$($best.Instance
 if ($best.AccountUuid -ne "Unknown") {
     Write-Host "    Account UUID: $($best.AccountUuid)" -ForegroundColor Gray
 }
-Write-Host "    Reason: Lowest active 5-hour usage score ($($best.FhScore)) & lowest 7-day score ($($best.SdScore))" -ForegroundColor Gray
+Write-Host "    Reason: Highest 5-hour capacity remaining (5h score: $($best.FhScore)). If tied/full, highest weekly capacity remaining (7d score: $($best.SdScore))." -ForegroundColor Gray
 
 if ($SelectOnly) {
     return $best

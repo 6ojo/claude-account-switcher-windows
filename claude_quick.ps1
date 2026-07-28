@@ -1,16 +1,19 @@
 <#
 .SYNOPSIS
-    Claude Desktop Multi-Instance Launcher for Windows
-    Translated from stracker-phil/claude_quick.sh
+    Claude Desktop Multi-Instance Launcher & Auto Account Switcher for Windows
+    Translated and expanded from stracker-phil/claude_quick.sh
 
 .DESCRIPTION
     Uses Electron's --user-data-dir flag to run fully isolated Claude Desktop instances on Windows.
-    Each instance gets its own data directory (config, sessions, plugins, etc.).
+    Each instance gets its own data directory (config, sessions, plugins, usage logs, etc.).
+    Includes automatic usage recalculation to auto-select and launch the instance with the most capacity remaining.
 
 .USAGE
     .\claude_quick.ps1                    # Show interactive menu
+    .\claude_quick.ps1 auto               # Recalculate usage & auto-launch instance with most remaining capacity
     .\claude_quick.ps1 <instance>         # Launch named instance
     .\claude_quick.ps1 list               # List all instances
+    .\claude_quick.ps1 usage              # View usage limits & reset timers for all accounts
     .\claude_quick.ps1 delete <name>      # Delete an instance
     .\claude_quick.ps1 shortcut <name>    # Create Desktop shortcut for instance
     .\claude_quick.ps1 diagnose           # Run diagnostics
@@ -274,6 +277,136 @@ function Show-Diagnostics {
     Write-Host ""
 }
 
+function Get-InstanceUsageStats ($inst) {
+    $isDefault = Test-IsDefaultInstance $inst
+    $dir = if ($isDefault) { Join-Path $env:APPDATA "Claude" } else { Join-Path $INSTANCES_BASE $inst }
+    $usageFile = Join-Path $dir "plan-usage-history.json"
+    $configFile = Join-Path $dir "config.json"
+
+    $nowMs = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()
+    $fiveHoursMs = 5 * 60 * 60 * 1000
+
+    $stats = [PSCustomObject]@{
+        InstanceName      = $inst
+        DataDir           = $dir
+        AccountUuid       = "Unknown"
+        FhScore           = 0
+        SdScore           = 0
+        LastActiveMs      = 0
+        LastActiveTime    = "Never"
+        WindowActive      = $false
+        ResetTime         = $null
+        StatusText        = "Full Capacity / Idle"
+    }
+
+    if (Test-Path $configFile) {
+        try {
+            $cfg = Get-Content $configFile -Raw | ConvertFrom-Json
+            if ($cfg.lastKnownAccountUuid) {
+                $stats.AccountUuid = $cfg.lastKnownAccountUuid
+            }
+        } catch {}
+    }
+
+    if (Test-Path $usageFile) {
+        try {
+            $data = Get-Content $usageFile -Raw | ConvertFrom-Json
+            if ($data.samples -and $data.samples.Count -gt 0) {
+                $latest = $data.samples | Select-Object -Last 1
+                $stats.LastActiveMs = $latest.t
+                $stats.LastActiveTime = [DateTimeOffset]::FromUnixTimeMilliseconds($latest.t).LocalDateTime.ToString("g")
+                $stats.SdScore = if ($latest.u.sd) { [int]$latest.u.sd } else { 0 }
+
+                $recentSamples = $data.samples | Where-Object { ($nowMs - $_.t) -le $fiveHoursMs }
+                $activeSamples = $recentSamples | Where-Object { $_.u.fh -gt 0 }
+
+                if ($activeSamples) {
+                    $firstActive = $activeSamples[0]
+                    $firstActiveTime = [DateTimeOffset]::FromUnixTimeMilliseconds($firstActive.t).LocalDateTime
+                    $resetTime = $firstActiveTime.AddHours(5)
+                    $timeRemaining = $resetTime - [DateTime]::Now
+
+                    if ($timeRemaining.TotalSeconds -gt 0) {
+                        $stats.WindowActive = $true
+                        $stats.FhScore = if ($latest.u.fh) { [int]$latest.u.fh } else { 0 }
+                        $stats.ResetTime = $resetTime
+                        $hours = [math]::Floor($timeRemaining.TotalHours)
+                        $mins = $timeRemaining.Minutes
+                        $stats.StatusText = "Active ($($stats.FhScore) 5h-score, reset in $hours`h $mins`m)"
+                    } else {
+                        $stats.FhScore = 0
+                        $stats.StatusText = "Window Reset / Full Capacity"
+                    }
+                }
+            }
+        } catch {}
+    }
+
+    return $stats
+}
+
+function Get-BestUsageInstance {
+    $instances = @("default") + (Get-InstanceList)
+    $allStats = foreach ($inst in $instances) {
+        Get-InstanceUsageStats $inst
+    }
+
+    # Rank by:
+    # 1. FhScore ascending (lowest 5-hour activity score)
+    # 2. SdScore ascending (lowest 7-day activity score)
+    # 3. LastActiveMs ascending (longest idle time)
+    $sorted = $allStats | Sort-Object FhScore, SdScore, LastActiveMs
+    return $sorted
+}
+
+function Launch-AutoInstance {
+    Write-Host "`n[*] Recalculating usage statistics across all accounts..." -ForegroundColor Gray
+    $ranked = Get-BestUsageInstance
+
+    Write-Host "`nUsage Rankings:" -ForegroundColor Yellow
+    Write-Host ("{0,-15} {1,-10} {2,-10} {3,-20} {4}" -f "Instance", "5h Score", "7d Score", "Last Active", "Status") -ForegroundColor Gray
+    Write-Host ("{0,-15} {1,-10} {2,-10} {3,-20} {4}" -f "--------", "--------", "--------", "-----------", "------") -ForegroundColor Gray
+
+    foreach ($stat in $ranked) {
+        $isTop = ($stat.InstanceName -eq $ranked[0].InstanceName)
+        $color = if ($isTop) { "Green" } else { "White" }
+        $prefix = if ($isTop) { "-> " } else { "   " }
+        $nameDisplay = $prefix + $stat.InstanceName
+        Write-Host ("{0,-15} {1,-10} {2,-10} {3,-20} {4}" -f $nameDisplay, $stat.FhScore, $stat.SdScore, $stat.LastActiveTime, $stat.StatusText) -ForegroundColor $color
+    }
+
+    $best = $ranked[0]
+    Write-Host "`n[+] Selected Instance with Most Usage Remaining: '$($best.InstanceName)'" -ForegroundColor Green
+    Write-Host "    Reason: Highest 5-hour capacity remaining (5h score: $($best.FhScore)). If tied/full, highest weekly capacity remaining (7d score: $($best.SdScore))." -ForegroundColor Gray
+    Launch-Instance $best.InstanceName
+}
+
+function Show-Usage {
+    Write-Host "`nClaude Desktop Account Usage Limits & Status" -ForegroundColor Cyan
+    Write-Host "=============================================" -ForegroundColor Cyan
+
+    $instances = @("default") + (Get-InstanceList)
+
+    foreach ($inst in $instances) {
+        $stats = Get-InstanceUsageStats $inst
+        Write-Host "`nInstance: $inst" -ForegroundColor Yellow
+        Write-Host "Data Path: $($stats.DataDir)" -ForegroundColor Gray
+        if ($stats.AccountUuid -ne "Unknown") {
+            Write-Host "  Account UUID: $($stats.AccountUuid)" -ForegroundColor Gray
+        }
+
+        if ($stats.LastActiveTime -ne "Never") {
+            Write-Host "  Last Active:                $($stats.LastActiveTime)"
+            Write-Host "  5-Hour Activity Score (fh): $($stats.FhScore)"
+            Write-Host "  7-Day Activity Score (sd):  $($stats.SdScore)"
+            Write-Host "  5-Hour Window Status:       $($stats.StatusText)" -ForegroundColor Green
+        } else {
+            Write-Host "  5-Hour Window Status:       No usage history recorded yet (Full Capacity Ready)" -ForegroundColor Green
+        }
+    }
+    Write-Host ""
+}
+
 # Main Script Logic
 Write-Host "======================================" -ForegroundColor Cyan
 Write-Host "  Claude Desktop Multi-Instance Launcher" -ForegroundColor Cyan
@@ -282,8 +415,22 @@ Write-Host "======================================" -ForegroundColor Cyan
 $cmdLower = if ($Command) { $Command.ToLower() } else { "" }
 
 switch ($cmdLower) {
+    "auto" {
+        Launch-AutoInstance
+        exit 0
+    }
+    "best" {
+        Launch-AutoInstance
+        exit 0
+    }
     "list" {
         List-Instances
+        exit 0
+    }
+    "usage" {
+        Show-Usage
+        Write-Host ""
+        Read-Host "Press Enter to exit..."
         exit 0
     }
     "delete" {
@@ -317,25 +464,31 @@ switch ($cmdLower) {
 # Interactive Menu Loop
 do {
     Write-Host ""
-    Write-Host "1. Launch default instance"
-    Write-Host "2. Select existing instance"
-    Write-Host "3. Create new instance"
-    Write-Host "4. Delete instance"
-    Write-Host "5. Create Desktop shortcut"
-    Write-Host "6. Diagnostics"
-    Write-Host "7. Exit"
+    Write-Host "1. Auto-select & launch instance with most usage remaining" -ForegroundColor Green
+    Write-Host "2. Launch default instance"
+    Write-Host "3. Select existing instance"
+    Write-Host "4. Create new instance"
+    Write-Host "5. View account usage limits & reset timers"
+    Write-Host "6. Delete instance"
+    Write-Host "7. Create Desktop shortcut"
+    Write-Host "8. Diagnostics"
+    Write-Host "9. Exit"
     Write-Host ""
     Write-Host "Tip: When logging into a new instance for the first time via browser SSO," -ForegroundColor Yellow
     Write-Host "     keep other Claude instances closed so the callback opens in the active instance." -ForegroundColor Yellow
     Write-Host ""
-    $choice = Read-Host "Select (1-7)"
+    $choice = Read-Host "Select (1-9)"
 
     switch ($choice) {
         "1" {
-            Launch-Instance "default"
+            Launch-AutoInstance
             $loop = $false
         }
         "2" {
+            Launch-Instance "default"
+            $loop = $false
+        }
+        "3" {
             List-Instances
             $n = Read-Host "Instance name"
             if ($n) {
@@ -343,7 +496,7 @@ do {
                 $loop = $false
             }
         }
-        "3" {
+        "4" {
             $n = Read-Host "New instance name"
             if (-not $n) {
                 Write-Host "[X] No name provided." -ForegroundColor Red
@@ -358,13 +511,19 @@ do {
                 $loop = $false
             }
         }
-        "4" {
+        "5" {
+            Show-Usage
+            Write-Host ""
+            Read-Host "Press Enter to continue..."
+            $loop = $true
+        }
+        "6" {
             Delete-Instance
             Write-Host ""
             Read-Host "Press Enter to continue..."
             $loop = $true
         }
-        "5" {
+        "7" {
             List-Instances
             $n = Read-Host "Instance name for shortcut"
             if ($n) { Create-DesktopShortcut $n }
@@ -372,13 +531,13 @@ do {
             Read-Host "Press Enter to continue..."
             $loop = $true
         }
-        "6" {
+        "8" {
             Show-Diagnostics
             Write-Host ""
             Read-Host "Press Enter to continue..."
             $loop = $true
         }
-        "7" {
+        "9" {
             $loop = $false
         }
         Default {
