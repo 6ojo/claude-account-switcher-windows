@@ -5,19 +5,20 @@ originally by Philipp Stracker, modified for windows
 
 ---
 
-
 ## usage
 
 1. download or clone this repository.
 2. open **`claude_quick.bat`**.
 3. select an option from the menu:
-   - **1**: launch the default instance
-   - **2**: select and launch an existing named instance (e.g. `work`, `personal`)
-   - **3**: create a new instance
-   - **4**: delete an instance
-   - **5**: create a Desktop shortcut for an instance
-   - **6**: run diagnostics to verify paths and active instances
-   - **7**: exit
+   - **1**: auto-select & launch instance with most usage remaining
+   - **2**: launch the default instance
+   - **3**: select and launch an existing named instance (e.g. `work`, `personal`)
+   - **4**: create a new instance
+   - **5**: view account usage limits & reset timers
+   - **6**: delete an instance
+   - **7**: create a Desktop shortcut for an instance
+   - **8**: run diagnostics to verify paths and active instances
+   - **9**: exit
 
 ---
 
@@ -26,11 +27,20 @@ originally by Philipp Stracker, modified for windows
 directly from PowerShell or Command Prompt:
 
 ```powershell
+# auto-select and launch instance with most usage remaining
+.\claude_quick.ps1 auto
+
+# run standalone auto-selector script
+.\claude_auto_select.ps1
+
 # show interactive menu
 .\claude_quick.ps1
 
 # launch a specific instance directly
 .\claude_quick.ps1 <name>
+
+# view usage limits & reset timers across all accounts
+.\claude_quick.ps1 usage
 
 # list all instances and shortcut status
 .\claude_quick.ps1 list
@@ -45,12 +55,28 @@ directly from PowerShell or Command Prompt:
 .\claude_quick.ps1 diagnose
 ```
 
-or via `claude_quick.bat`:
+Or via `claude_quick.bat`:
 ```cmd
-claude_quick.bat <name>
+claude_quick.bat auto
+claude_quick.bat usage
 claude_quick.bat list
 claude_quick.bat diagnose
 ```
+
+---
+
+## auto-select & usage recalculation
+- the reset times are estimates
+- highest 5hr limit chosen
+
+every time `auto` is run (`.\claude_quick.ps1 auto` or `.\claude_auto_select.ps1`):
+1. **recalculates usage**: reads `plan-usage-history.json` across all instances (`default` + custom instances in `~/.claude-instances`).
+2. **evaluates 5-hour window**: checks active rolling usage (`fh`). if 5 hours have passed since first query, usage resets to 0 (full capacity).
+3. **ranks accounts**:
+   - lowest 5-hour activity score (`fh` = 0 is best / highest capacity remaining)
+   - lowest 7-day usage score (`sd`)
+   - longest idle duration
+4. **launches best account**: displays the ranking table and launches the top-ranked instance immediately.
 
 ---
 ## creating new instance
