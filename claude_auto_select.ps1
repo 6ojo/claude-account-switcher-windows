@@ -73,9 +73,57 @@ function Get-ClaudeExePath {
     return $null
 }
 
+function Get-DefaultInstanceDir {
+    $candidates = @()
+
+    # Standard Win32 APPDATA path
+    $stdPath = Join-Path $env:APPDATA "Claude"
+    $candidates += $stdPath
+
+    # Windows Store / MSIX package sandboxed APPDATA paths
+    $packagesBase = Join-Path $env:LOCALAPPDATA "Packages"
+    if (Test-Path $packagesBase) {
+        $storeDirs = Get-ChildItem -Path $packagesBase -Filter "Claude_*" -Directory -ErrorAction SilentlyContinue | ForEach-Object {
+            Join-Path $_.FullName "LocalCache\Roaming\Claude"
+        }
+        if ($storeDirs) {
+            $candidates += $storeDirs
+        }
+    }
+
+    # Additional fallback
+    $localPath = Join-Path $env:LOCALAPPDATA "Claude"
+    if ($localPath -ne $stdPath) {
+        $candidates += $localPath
+    }
+
+    # 1. Prefer candidate directory containing plan-usage-history.json
+    foreach ($c in $candidates) {
+        if (Test-Path (Join-Path $c "plan-usage-history.json")) {
+            return $c
+        }
+    }
+
+    # 2. Prefer candidate directory containing config.json
+    foreach ($c in $candidates) {
+        if (Test-Path (Join-Path $c "config.json")) {
+            return $c
+        }
+    }
+
+    # 3. Prefer first candidate directory that exists
+    foreach ($c in $candidates) {
+        if (Test-Path $c) {
+            return $c
+        }
+    }
+
+    return $stdPath
+}
+
 function Get-InstanceUsageStats ($inst) {
     $isDefault = Test-IsDefaultInstance $inst
-    $dir = if ($isDefault) { Join-Path $env:APPDATA "Claude" } else { Join-Path $INSTANCES_BASE $inst }
+    $dir = if ($isDefault) { Get-DefaultInstanceDir } else { Join-Path $INSTANCES_BASE $inst }
     $usageFile = Join-Path $dir "plan-usage-history.json"
     $configFile = Join-Path $dir "config.json"
 
