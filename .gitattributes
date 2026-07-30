@@ -1,0 +1,18 @@
+# Line endings are stored as LF in the repository and checked out per-platform.
+# Without this, whether a file lands as LF or CRLF depends on each contributor's
+# core.autocrlf setting, which produces noisy whitespace-only diffs.
+
+* text=auto
+
+# Windows scripts must be CRLF in the working tree. Batch files in particular can
+# misbehave with LF endings, and PowerShell here-strings are easier to reason about
+# when the file matches what every other Windows tool writes.
+*.ps1 text eol=crlf
+*.psm1 text eol=crlf
+*.psd1 text eol=crlf
+*.bat text eol=crlf
+*.cmd text eol=crlf
+
+*.md text eol=lf
+*.yml text eol=lf
+*.yaml text eol=lf
