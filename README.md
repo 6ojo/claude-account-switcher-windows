@@ -7,7 +7,7 @@ originally by Philipp Stracker, modified for windows
 
 ## usage
 
-1. download or clone this repository.
+1. download or clone this repository. keep the files together — they depend on each other.
 2. open **`claude_quick.bat`**.
 3. select an option from the menu:
    - **1**: auto-select & launch instance with most usage remaining
@@ -17,8 +17,22 @@ originally by Philipp Stracker, modified for windows
    - **5**: view account usage limits & reset timers
    - **6**: delete an instance
    - **7**: create a Desktop shortcut for an instance
-   - **8**: run diagnostics to verify paths and active instances
+   - **8**: run read-only diagnostics (paths, install type, instances, protocol handler)
    - **9**: exit
+
+---
+
+## files
+
+| file | role |
+| --- | --- |
+| `claude_quick.bat` | entry point — launches `claude_quick.ps1` |
+| `claude_quick.ps1` | menu, command dispatch, and user-facing actions |
+| `claude_common.ps1` | shared helpers: executable resolution, instance discovery, usage stats, launching |
+| `claude_diagnose.ps1` | read-only diagnostics report |
+| `claude_auto_select.ps1` | standalone usage-based auto-selector |
+
+`claude_common.ps1` is dot-sourced by the other scripts and is not meant to be run directly.
 
 ---
 

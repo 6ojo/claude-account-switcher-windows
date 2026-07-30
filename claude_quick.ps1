@@ -8,6 +8,8 @@
     Each instance gets its own data directory (config, sessions, plugins, usage logs, etc.).
     Includes automatic usage recalculation to auto-select and launch the instance with the most capacity remaining.
 
+    Requires claude_common.ps1 and claude_diagnose.ps1 alongside this file.
+
 .USAGE
     .\claude_quick.ps1                    # Show interactive menu
     .\claude_quick.ps1 auto               # Recalculate usage & auto-launch instance with most remaining capacity
@@ -16,7 +18,7 @@
     .\claude_quick.ps1 usage              # View usage limits & reset timers for all accounts
     .\claude_quick.ps1 delete <name>      # Delete an instance
     .\claude_quick.ps1 shortcut <name>    # Create Desktop shortcut for instance
-    .\claude_quick.ps1 diagnose           # Run diagnostics
+    .\claude_quick.ps1 diagnose           # Run read-only diagnostics
 #>
 
 param (
@@ -29,101 +31,43 @@ param (
 
 $ErrorActionPreference = "Stop"
 
-$INSTANCES_BASE = Join-Path $HOME ".claude-instances"
-$DESKTOP_PATH = [System.Environment]::GetFolderPath([System.Environment+SpecialFolder]::Desktop)
-
-function Get-ClaudeExePath {
-    $candidates = @(
-        "$env:LOCALAPPDATA\Programs\Claude\Claude.exe",
-        "$env:LOCALAPPDATA\Claude\Claude.exe",
-        "$env:LOCALAPPDATA\AnthropicClaude\Claude.exe",
-        "$env:LOCALAPPDATA\Programs\claude-desktop\Claude.exe",
-        "$env:ProgramFiles\Claude\Claude.exe",
-        "${env:ProgramFiles(x86)}\Claude\Claude.exe"
-    )
-
-    foreach ($path in $candidates) {
-        if (Test-Path $path) {
-            return $path
-        }
+foreach ($dependency in @("claude_common.ps1", "claude_diagnose.ps1")) {
+    $dependencyPath = Join-Path $PSScriptRoot $dependency
+    if (-not (Test-Path $dependencyPath)) {
+        Write-Host "[X] Required file '$dependency' is missing from $PSScriptRoot" -ForegroundColor Red
+        Write-Host "    Download the full project, not just claude_quick.ps1." -ForegroundColor Yellow
+        exit 1
     }
-
-    # Search WindowsApps (MSIX/Store installation)
-    $winAppsClaude = Get-ChildItem -Path "$env:ProgramFiles\WindowsApps" -Filter "claude.exe" -Recurse -Depth 3 -ErrorAction SilentlyContinue | Select-Object -ExpandProperty FullName -First 1
-    if ($winAppsClaude -and (Test-Path $winAppsClaude)) {
-        return $winAppsClaude
-    }
-
-    # Saved custom path check
-    $configPath = Join-Path $INSTANCES_BASE "claude_exe_path.txt"
-    if (Test-Path $configPath) {
-        $rawContent = Get-Content $configPath -Raw
-        if ($rawContent) {
-            $savedPath = $rawContent.Trim().Trim('"', "'").Trim()
-            if ($savedPath -and (Test-Path $savedPath)) {
-                return $savedPath
-            }
-        }
-    }
-
-    return $null
+    . $dependencyPath
 }
 
-function Ensure-ClaudeExe {
-    $exe = Get-ClaudeExePath
-    if (-not $exe) {
-        Write-Host "[!] Claude Desktop executable (Claude.exe) was not automatically found." -ForegroundColor Yellow
-        Write-Host "If you have Claude Desktop installed in a custom path, please enter the full path to Claude.exe below."
-        Write-Host "Otherwise, download and install Claude Desktop from https://claude.ai/download" -ForegroundColor Cyan
-        Write-Host ""
-        $rawInput = Read-Host "Enter full path to Claude.exe (or press Enter to cancel)"
-        $inputPath = if ($rawInput) { $rawInput.Trim().Trim('"', "'").Trim() } else { "" }
+# Numbered picker over instances that actually exist on disk. Returns $null if cancelled.
+function Select-ExistingInstance ($promptLabel) {
+    if (-not $promptLabel) { $promptLabel = "Select instance" }
 
-        if ($inputPath -and (Test-Path $inputPath)) {
-            New-Item -ItemType Directory -Force -Path $INSTANCES_BASE | Out-Null
-            Set-Content -Path (Join-Path $INSTANCES_BASE "claude_exe_path.txt") -Value $inputPath
-            return $inputPath
-        } else {
-            Write-Host "[X] Claude Desktop executable not found." -ForegroundColor Red
-            exit 1
-        }
-    }
-    return $exe
-}
+    $options = @("default") + (Get-InstanceList)
 
-function Get-InstanceList {
-    if (-not (Test-Path $INSTANCES_BASE)) {
-        return @()
-    }
-    Get-ChildItem -Path $INSTANCES_BASE -Directory | Select-Object -ExpandProperty Name
-}
-
-function List-Instances {
     Write-Host "`nClaude Desktop Instances" -ForegroundColor Cyan
     Write-Host "========================" -ForegroundColor Cyan
     Write-Host ""
-    Write-Host "  - default (built-in default data directory)"
-
-    $instances = Get-InstanceList
-    foreach ($name in $instances) {
-        $shortcutName = "Claude - $name.lnk"
-        $hasShortcut = Test-Path (Join-Path $DESKTOP_PATH $shortcutName)
-        $shortcutStatus = if ($hasShortcut) { "has shortcut" } else { "no shortcut" }
-        Write-Host "  - $name ($shortcutStatus)"
+    for ($i = 0; $i -lt $options.Count; $i++) {
+        $label = if (Test-IsDefaultInstance $options[$i]) { "default (built-in default data directory)" } else { $options[$i] }
+        Write-Host ("  {0}. {1}" -f ($i + 1), $label)
     }
     Write-Host ""
-}
+    Write-Host "  0. Cancel" -ForegroundColor Gray
+    Write-Host ""
 
-function Test-IsDefaultInstance ($name) {
-    return ($name -eq "default")
-}
+    $raw = (Read-Host "$promptLabel (0-$($options.Count))").Trim()
+    if ($raw -eq "0" -or $raw -eq "") { return $null }
 
-function Test-ValidInstanceName ($name) {
-    if (-not $name) { return $false }
-    if ($name -match '[\\/:*?"<>|]' -or $name -eq "." -or $name -eq "..") {
-        return $false
+    $index = 0
+    if (-not [int]::TryParse($raw, [ref]$index) -or $index -lt 1 -or $index -gt $options.Count) {
+        Write-Host "[X] '$raw' is not one of the listed numbers." -ForegroundColor Red
+        return $null
     }
-    return $true
+
+    return $options[$index - 1]
 }
 
 function Create-DesktopShortcut ($instanceName, $displayName) {
@@ -167,71 +111,30 @@ function Create-DesktopShortcut ($instanceName, $displayName) {
     Write-Host "[+] Shortcut created on Desktop: $shortcutPath" -ForegroundColor Green
 }
 
-function Test-ClaudeIsRunning {
-    $procs = Get-Process -Name "claude" -ErrorAction SilentlyContinue
-    return ($null -ne $procs -and $procs.Count -gt 0)
-}
-
-function Stop-ClaudeProcesses {
-    $procs = Get-Process -Name "claude" -ErrorAction SilentlyContinue
-    if ($procs) {
-        Write-Host "[*] Stopping running Claude Desktop processes..." -ForegroundColor Yellow
-        Stop-Process -Name "claude" -Force -ErrorAction SilentlyContinue
-        Start-Sleep -Seconds 1
-        Write-Host "[+] Running Claude Desktop processes stopped." -ForegroundColor Green
-    }
-}
-
 function Confirm-CloseRunningClaude ($contextMsg) {
     if (Test-ClaudeIsRunning) {
         Write-Host "`n[!] Notice: Claude Desktop is currently running." -ForegroundColor Yellow
         if ($contextMsg) {
             Write-Host "    $contextMsg" -ForegroundColor Yellow
         }
-        Write-Host "    Closing existing instances ensures browser SSO sign-in links (claude://) route to the target account." -ForegroundColor Yellow
-        $stopConfirm = Read-Host "Close existing running Claude processes now? (Y/n)"
+        Write-Host "    Closing it avoids two instances competing for the same window focus." -ForegroundColor Yellow
+        Write-Host "    Note: this does NOT redirect browser sign-in links. Claude re-registers itself" -ForegroundColor Yellow
+        Write-Host "    as the claude:// handler on every launch, so those links land in the default" -ForegroundColor Yellow
+        Write-Host "    profile regardless. Copy the sign-in code and paste it into the target window." -ForegroundColor Yellow
+        $stopConfirm = Read-Host "Close running Claude Desktop processes now? (Y/n)"
         if ($stopConfirm -notmatch '^[Nn]$') {
             Stop-ClaudeProcesses
         }
     }
 }
 
-function Launch-Instance ($instanceName) {
-    if (-not (Test-ValidInstanceName $instanceName)) {
-        Write-Host "[X] Invalid instance name. Do not use path separators or special characters." -ForegroundColor Red
-        return
-    }
-
-    $claudeExe = Ensure-ClaudeExe
-
-    Write-Host "`n[*] Launching Claude Desktop instance: $instanceName..." -ForegroundColor Cyan
-
-    $outLog = Join-Path $env:TEMP "claude_app_out.log"
-    $errLog = Join-Path $env:TEMP "claude_app_err.log"
-
-    if (Test-IsDefaultInstance $instanceName) {
-        Start-Process -FilePath $claudeExe -RedirectStandardOutput $outLog -RedirectStandardError $errLog
-        Write-Host "[+] Claude Desktop launched (default instance)" -ForegroundColor Green
-    } else {
-        $instanceDir = Join-Path $INSTANCES_BASE $instanceName
-        New-Item -ItemType Directory -Force -Path $instanceDir | Out-Null
-        
-        Start-Process -FilePath $claudeExe -ArgumentList "--user-data-dir=`"$instanceDir`"" -RedirectStandardOutput $outLog -RedirectStandardError $errLog
-        Write-Host "[+] Claude Desktop launched (instance: $instanceName)" -ForegroundColor Green
-        Write-Host "    Data Dir: $instanceDir" -ForegroundColor Gray
-    }
-
-    $shortcutName = "Claude - $instanceName.lnk"
-    if (-not (Test-Path (Join-Path $DESKTOP_PATH $shortcutName))) {
-        Write-Host "    Tip: Run '.\claude_quick.ps1 shortcut $instanceName' to create a Desktop shortcut." -ForegroundColor Yellow
-    }
-}
-
 function Delete-Instance ($instanceName) {
     if (-not $instanceName) {
-        List-Instances
-        $instanceName = Read-Host "Instance name to delete"
+        $instanceName = Select-ExistingInstance "Instance to delete"
+        if (-not $instanceName) { return }
     }
+
+    $instanceName = Get-CleanInstanceName $instanceName
 
     if (-not (Test-ValidInstanceName $instanceName)) {
         Write-Host "[X] Invalid instance name." -ForegroundColor Red
@@ -269,174 +172,6 @@ function Delete-Instance ($instanceName) {
         Remove-Item -Force $shortcutPath
     }
     Write-Host "[+] Instance '$instanceName' deleted successfully." -ForegroundColor Green
-}
-
-function Show-Diagnostics {
-    Write-Host "`nClaude Desktop Diagnostics (Windows)" -ForegroundColor Cyan
-    Write-Host "====================================" -ForegroundColor Cyan
-
-    $exe = Get-ClaudeExePath
-    if ($exe) {
-        Write-Host "[+] Claude.exe found: $exe" -ForegroundColor Green
-    } else {
-        Write-Host "[X] Claude.exe NOT found in standard locations." -ForegroundColor Red
-        Write-Host "    Download from https://claude.ai/download" -ForegroundColor Yellow
-    }
-
-    Write-Host "`nInstance Directory Base: $INSTANCES_BASE"
-    if (Test-Path $INSTANCES_BASE) {
-        $instances = Get-InstanceList
-        if ($instances.Count -gt 0) {
-            foreach ($i in $instances) {
-                Write-Host "  - $i"
-            }
-        } else {
-            Write-Host "  (no custom instances found)"
-        }
-    } else {
-        Write-Host "  (instances directory does not exist yet)"
-    }
-
-    Write-Host "`nDesktop Shortcuts:"
-    $shortcuts = Get-ChildItem -Path $DESKTOP_PATH -Filter "Claude - *.lnk" -ErrorAction SilentlyContinue
-    if ($shortcuts) {
-        foreach ($s in $shortcuts) {
-            Write-Host "  - $($s.Name)"
-        }
-    } else {
-        Write-Host "  (none)"
-    }
-    Write-Host ""
-}
-
-function Get-DefaultInstanceDir {
-    $candidates = @()
-
-    # Standard Win32 APPDATA path
-    $stdPath = Join-Path $env:APPDATA "Claude"
-    $candidates += $stdPath
-
-    # Windows Store / MSIX package sandboxed APPDATA paths
-    $packagesBase = Join-Path $env:LOCALAPPDATA "Packages"
-    if (Test-Path $packagesBase) {
-        $storeDirs = Get-ChildItem -Path $packagesBase -Filter "Claude_*" -Directory -ErrorAction SilentlyContinue | ForEach-Object {
-            Join-Path $_.FullName "LocalCache\Roaming\Claude"
-        }
-        if ($storeDirs) {
-            $candidates += $storeDirs
-        }
-    }
-
-    # Additional fallback
-    $localPath = Join-Path $env:LOCALAPPDATA "Claude"
-    if ($localPath -ne $stdPath) {
-        $candidates += $localPath
-    }
-
-    # 1. Prefer candidate directory containing plan-usage-history.json
-    foreach ($c in $candidates) {
-        if (Test-Path (Join-Path $c "plan-usage-history.json")) {
-            return $c
-        }
-    }
-
-    # 2. Prefer candidate directory containing config.json
-    foreach ($c in $candidates) {
-        if (Test-Path (Join-Path $c "config.json")) {
-            return $c
-        }
-    }
-
-    # 3. Prefer first candidate directory that exists
-    foreach ($c in $candidates) {
-        if (Test-Path $c) {
-            return $c
-        }
-    }
-
-    return $stdPath
-}
-
-function Get-InstanceUsageStats ($inst) {
-    $isDefault = Test-IsDefaultInstance $inst
-    $dir = if ($isDefault) { Get-DefaultInstanceDir } else { Join-Path $INSTANCES_BASE $inst }
-    $usageFile = Join-Path $dir "plan-usage-history.json"
-    $configFile = Join-Path $dir "config.json"
-
-    $nowMs = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()
-    $fiveHoursMs = 5 * 60 * 60 * 1000
-
-    $stats = [PSCustomObject]@{
-        InstanceName      = $inst
-        DataDir           = $dir
-        AccountUuid       = "Unknown"
-        FhScore           = 0
-        SdScore           = 0
-        LastActiveMs      = 0
-        LastActiveTime    = "Never"
-        WindowActive      = $false
-        ResetTime         = $null
-        StatusText        = "Full Capacity / Idle"
-    }
-
-    if (Test-Path $configFile) {
-        try {
-            $cfg = Get-Content $configFile -Raw | ConvertFrom-Json
-            if ($cfg.lastKnownAccountUuid) {
-                $stats.AccountUuid = $cfg.lastKnownAccountUuid
-            }
-        } catch {}
-    }
-
-    if (Test-Path $usageFile) {
-        try {
-            $data = Get-Content $usageFile -Raw | ConvertFrom-Json
-            if ($data.samples -and $data.samples.Count -gt 0) {
-                $latest = $data.samples | Select-Object -Last 1
-                $stats.LastActiveMs = $latest.t
-                $stats.LastActiveTime = [DateTimeOffset]::FromUnixTimeMilliseconds($latest.t).LocalDateTime.ToString("g")
-                $stats.SdScore = if ($latest.u.sd) { [int]$latest.u.sd } else { 0 }
-
-                $recentSamples = $data.samples | Where-Object { ($nowMs - $_.t) -le $fiveHoursMs }
-                $activeSamples = $recentSamples | Where-Object { $_.u.fh -gt 0 }
-
-                if ($activeSamples) {
-                    $firstActive = $activeSamples[0]
-                    $firstActiveTime = [DateTimeOffset]::FromUnixTimeMilliseconds($firstActive.t).LocalDateTime
-                    $resetTime = $firstActiveTime.AddHours(5)
-                    $timeRemaining = $resetTime - [DateTime]::Now
-
-                    if ($timeRemaining.TotalSeconds -gt 0) {
-                        $stats.WindowActive = $true
-                        $stats.FhScore = if ($latest.u.fh) { [int]$latest.u.fh } else { 0 }
-                        $stats.ResetTime = $resetTime
-                        $hours = [math]::Floor($timeRemaining.TotalHours)
-                        $mins = $timeRemaining.Minutes
-                        $stats.StatusText = "Active ($($stats.FhScore) 5h-score, reset in $hours`h $mins`m)"
-                    } else {
-                        $stats.FhScore = 0
-                        $stats.StatusText = "Window Reset / Full Capacity"
-                    }
-                }
-            }
-        } catch {}
-    }
-
-    return $stats
-}
-
-function Get-BestUsageInstance {
-    $instances = @("default") + (Get-InstanceList)
-    $allStats = foreach ($inst in $instances) {
-        Get-InstanceUsageStats $inst
-    }
-
-    # Rank by:
-    # 1. FhScore ascending (lowest 5-hour activity score)
-    # 2. SdScore ascending (lowest 7-day activity score)
-    # 3. LastActiveMs ascending (longest idle time)
-    $sorted = $allStats | Sort-Object FhScore, SdScore, LastActiveMs
-    return $sorted
 }
 
 function Launch-AutoInstance {
@@ -519,8 +254,9 @@ switch ($cmdLower) {
     }
     "shortcut" {
         if (-not $Name) {
-            List-Instances
-            $Name = Read-Host "Instance name for shortcut"
+            $Name = Select-ExistingInstance "Instance for shortcut"
+        } else {
+            $Name = Get-CleanInstanceName $Name
         }
         if ($Name) {
             Create-DesktopShortcut $Name
@@ -554,8 +290,9 @@ do {
     Write-Host "8. Diagnostics"
     Write-Host "9. Exit"
     Write-Host ""
-    Write-Host "Tip: When logging into a new instance for the first time via browser SSO," -ForegroundColor Yellow
-    Write-Host "     keep other Claude instances closed so the callback opens in the active instance." -ForegroundColor Yellow
+    Write-Host "Tip: Browser sign-in links (claude://) always open the DEFAULT profile, because" -ForegroundColor Yellow
+    Write-Host "     Claude re-registers itself as the claude:// handler on every launch. When" -ForegroundColor Yellow
+    Write-Host "     signing into a new instance, copy the code and paste it into that window." -ForegroundColor Yellow
     Write-Host ""
     $choice = Read-Host "Select (1-9)"
 
@@ -569,8 +306,9 @@ do {
             $loop = $false
         }
         "3" {
-            List-Instances
-            $n = Read-Host "Instance name"
+            # Pick by number rather than retyping the name. Retyping is how a stray space or a
+            # typo turns into a launch against a brand-new empty profile.
+            $n = Select-ExistingInstance
             if ($n) {
                 Confirm-CloseRunningClaude "Switching instance."
                 Launch-Instance $n
@@ -578,11 +316,17 @@ do {
             }
         }
         "4" {
-            $n = Read-Host "New instance name"
+            $n = Get-CleanInstanceName (Read-Host "New instance name")
             if (-not $n) {
                 Write-Host "[X] No name provided." -ForegroundColor Red
             } elseif (Test-IsDefaultInstance $n) {
                 Write-Host "[X] 'default' is reserved for the built-in instance." -ForegroundColor Red
+            } elseif (-not (Test-ValidInstanceName $n)) {
+                Write-Host "[X] Invalid instance name: '$n'" -ForegroundColor Red
+                Write-Host "    Avoid path separators, special characters, reserved device names, and names over 64 chars." -ForegroundColor Gray
+            } elseif (Test-InstanceExists $n) {
+                Write-Host "[!] Instance '$(Resolve-InstanceName $n)' already exists." -ForegroundColor Yellow
+                Write-Host "    Use option 3 to launch it. Nothing was changed." -ForegroundColor Gray
             } else {
                 $createSc = Read-Host "Create a Desktop shortcut for '$n'? (Y/n)"
                 if ($createSc -notmatch '^[Nn]$') {
@@ -590,7 +334,7 @@ do {
                 }
                 Confirm-CloseRunningClaude "Creating and logging into a new instance."
                 Write-Host "`n[*] Starting new instance '$n'. Complete sign-in in the launched window." -ForegroundColor Cyan
-                Launch-Instance $n
+                Launch-Instance $n -AllowCreate
                 $loop = $false
             }
         }
@@ -607,8 +351,7 @@ do {
             $loop = $true
         }
         "7" {
-            List-Instances
-            $n = Read-Host "Instance name for shortcut"
+            $n = Select-ExistingInstance "Instance for shortcut"
             if ($n) { Create-DesktopShortcut $n }
             Write-Host ""
             Read-Host "Press Enter to continue..."
