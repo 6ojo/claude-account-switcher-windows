@@ -98,6 +98,60 @@ function Get-InstanceList {
     Get-ChildItem -Path $INSTANCES_BASE -Directory | Select-Object -ExpandProperty Name
 }
 
+function Test-InstanceHasShortcut ($instanceName) {
+    if (Test-IsDefaultInstance $instanceName) {
+        return (Test-Path (Join-Path $DESKTOP_PATH "Claude.lnk")) -or (Test-Path (Join-Path $DESKTOP_PATH "Claude - Default.lnk"))
+    }
+
+    $displayName = $instanceName.Substring(0,1).ToUpper() + $instanceName.Substring(1)
+    $candidates = @(
+        "Claude - $instanceName.lnk",
+        "Claude - $displayName.lnk"
+    )
+
+    foreach ($c in $candidates) {
+        if (Test-Path (Join-Path $DESKTOP_PATH $c)) {
+            return $true
+        }
+    }
+
+    $desktopShortcuts = Get-ChildItem -Path $DESKTOP_PATH -Filter "Claude - *.lnk" -ErrorAction SilentlyContinue
+    if ($desktopShortcuts) {
+        try {
+            $wshShell = New-Object -ComObject WScript.Shell
+            foreach ($s in $desktopShortcuts) {
+                $sc = $wshShell.CreateShortcut($s.FullName)
+                if ($sc.Arguments -and $sc.Arguments -like "*$instanceName*") {
+                    return $true
+                }
+            }
+        } catch {}
+    }
+
+    return $false
+}
+
+function Set-ClaudeProtocolHandler ($instanceName) {
+    $claudeExe = Get-ClaudeExePath
+    if (-not $claudeExe) { return }
+
+    $regPath = "HKCU:\Software\Classes\claude\shell\open\command"
+    
+    $commandValue = if (Test-IsDefaultInstance $instanceName) {
+        "`"$claudeExe`" -- `"%1`""
+    } else {
+        $instanceDir = Join-Path $INSTANCES_BASE $instanceName
+        "`"$claudeExe`" --user-data-dir=`"$instanceDir`" -- `"%1`""
+    }
+
+    try {
+        if (-not (Test-Path "HKCU:\Software\Classes\claude\shell\open\command")) {
+            New-Item -Path "HKCU:\Software\Classes\claude\shell\open\command" -Force | Out-Null
+        }
+        Set-ItemProperty -Path "HKCU:\Software\Classes\claude\shell\open\command" -Name "(default)" -Value $commandValue -ErrorAction SilentlyContinue
+    } catch {}
+}
+
 function List-Instances {
     Write-Host "`nClaude Desktop Instances" -ForegroundColor Cyan
     Write-Host "========================" -ForegroundColor Cyan
@@ -106,8 +160,7 @@ function List-Instances {
 
     $instances = Get-InstanceList
     foreach ($name in $instances) {
-        $shortcutName = "Claude - $name.lnk"
-        $hasShortcut = Test-Path (Join-Path $DESKTOP_PATH $shortcutName)
+        $hasShortcut = Test-InstanceHasShortcut $name
         $shortcutStatus = if ($hasShortcut) { "has shortcut" } else { "no shortcut" }
         Write-Host "  - $name ($shortcutStatus)"
     }
@@ -204,6 +257,9 @@ function Launch-Instance ($instanceName) {
 
     $claudeExe = Ensure-ClaudeExe
 
+    # Register protocol handler so browser SSO deep links (claude://) route to this instance
+    Set-ClaudeProtocolHandler $instanceName
+
     Write-Host "`n[*] Launching Claude Desktop instance: $instanceName..." -ForegroundColor Cyan
 
     $outLog = Join-Path $env:TEMP "claude_app_out.log"
@@ -221,8 +277,7 @@ function Launch-Instance ($instanceName) {
         Write-Host "    Data Dir: $instanceDir" -ForegroundColor Gray
     }
 
-    $shortcutName = "Claude - $instanceName.lnk"
-    if (-not (Test-Path (Join-Path $DESKTOP_PATH $shortcutName))) {
+    if (-not (Test-InstanceHasShortcut $instanceName)) {
         Write-Host "    Tip: Run '.\claude_quick.ps1 shortcut $instanceName' to create a Desktop shortcut." -ForegroundColor Yellow
     }
 }

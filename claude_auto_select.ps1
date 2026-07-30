@@ -234,12 +234,33 @@ if ($SelectOnly) {
     return $best
 }
 
+function Set-ClaudeProtocolHandler ($instanceName) {
+    $claudeExe = Get-ClaudeExePath
+    if (-not $claudeExe) { return }
+
+    $commandValue = if (Test-IsDefaultInstance $instanceName) {
+        "`"$claudeExe`" -- `"%1`""
+    } else {
+        $instanceDir = Join-Path $INSTANCES_BASE $instanceName
+        "`"$claudeExe`" --user-data-dir=`"$instanceDir`" -- `"%1`""
+    }
+
+    try {
+        if (-not (Test-Path "HKCU:\Software\Classes\claude\shell\open\command")) {
+            New-Item -Path "HKCU:\Software\Classes\claude\shell\open\command" -Force | Out-Null
+        }
+        Set-ItemProperty -Path "HKCU:\Software\Classes\claude\shell\open\command" -Name "(default)" -Value $commandValue -ErrorAction SilentlyContinue
+    } catch {}
+}
+
 # Launch the selected instance
 $claudeExe = Get-ClaudeExePath
 if (-not $claudeExe) {
     Write-Host "[!] Claude Desktop executable not found." -ForegroundColor Red
     exit 1
 }
+
+Set-ClaudeProtocolHandler $best.InstanceName
 
 $outLog = Join-Path $env:TEMP "claude_app_out.log"
 $errLog = Join-Path $env:TEMP "claude_app_err.log"
