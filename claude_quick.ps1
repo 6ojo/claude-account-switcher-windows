@@ -167,6 +167,35 @@ function Create-DesktopShortcut ($instanceName, $displayName) {
     Write-Host "[+] Shortcut created on Desktop: $shortcutPath" -ForegroundColor Green
 }
 
+function Test-ClaudeIsRunning {
+    $procs = Get-Process -Name "claude" -ErrorAction SilentlyContinue
+    return ($null -ne $procs -and $procs.Count -gt 0)
+}
+
+function Stop-ClaudeProcesses {
+    $procs = Get-Process -Name "claude" -ErrorAction SilentlyContinue
+    if ($procs) {
+        Write-Host "[*] Stopping running Claude Desktop processes..." -ForegroundColor Yellow
+        Stop-Process -Name "claude" -Force -ErrorAction SilentlyContinue
+        Start-Sleep -Seconds 1
+        Write-Host "[+] Running Claude Desktop processes stopped." -ForegroundColor Green
+    }
+}
+
+function Confirm-CloseRunningClaude ($contextMsg) {
+    if (Test-ClaudeIsRunning) {
+        Write-Host "`n[!] Notice: Claude Desktop is currently running." -ForegroundColor Yellow
+        if ($contextMsg) {
+            Write-Host "    $contextMsg" -ForegroundColor Yellow
+        }
+        Write-Host "    Closing existing instances ensures browser SSO sign-in links (claude://) route to the target account." -ForegroundColor Yellow
+        $stopConfirm = Read-Host "Close existing running Claude processes now? (Y/n)"
+        if ($stopConfirm -notmatch '^[Nn]$') {
+            Stop-ClaudeProcesses
+        }
+    }
+}
+
 function Launch-Instance ($instanceName) {
     if (-not (Test-ValidInstanceName $instanceName)) {
         Write-Host "[X] Invalid instance name. Do not use path separators or special characters." -ForegroundColor Red
@@ -177,14 +206,17 @@ function Launch-Instance ($instanceName) {
 
     Write-Host "`n[*] Launching Claude Desktop instance: $instanceName..." -ForegroundColor Cyan
 
+    $outLog = Join-Path $env:TEMP "claude_app_out.log"
+    $errLog = Join-Path $env:TEMP "claude_app_err.log"
+
     if (Test-IsDefaultInstance $instanceName) {
-        Start-Process -FilePath $claudeExe
+        Start-Process -FilePath $claudeExe -RedirectStandardOutput $outLog -RedirectStandardError $errLog
         Write-Host "[+] Claude Desktop launched (default instance)" -ForegroundColor Green
     } else {
         $instanceDir = Join-Path $INSTANCES_BASE $instanceName
         New-Item -ItemType Directory -Force -Path $instanceDir | Out-Null
         
-        Start-Process -FilePath $claudeExe -ArgumentList "--user-data-dir=`"$instanceDir`""
+        Start-Process -FilePath $claudeExe -ArgumentList "--user-data-dir=`"$instanceDir`"" -RedirectStandardOutput $outLog -RedirectStandardError $errLog
         Write-Host "[+] Claude Desktop launched (instance: $instanceName)" -ForegroundColor Green
         Write-Host "    Data Dir: $instanceDir" -ForegroundColor Gray
     }
@@ -540,6 +572,7 @@ do {
             List-Instances
             $n = Read-Host "Instance name"
             if ($n) {
+                Confirm-CloseRunningClaude "Switching instance."
                 Launch-Instance $n
                 $loop = $false
             }
@@ -551,11 +584,13 @@ do {
             } elseif (Test-IsDefaultInstance $n) {
                 Write-Host "[X] 'default' is reserved for the built-in instance." -ForegroundColor Red
             } else {
-                Launch-Instance $n
                 $createSc = Read-Host "Create a Desktop shortcut for '$n'? (Y/n)"
                 if ($createSc -notmatch '^[Nn]$') {
                     Create-DesktopShortcut $n
                 }
+                Confirm-CloseRunningClaude "Creating and logging into a new instance."
+                Write-Host "`n[*] Starting new instance '$n'. Complete sign-in in the launched window." -ForegroundColor Cyan
+                Launch-Instance $n
                 $loop = $false
             }
         }

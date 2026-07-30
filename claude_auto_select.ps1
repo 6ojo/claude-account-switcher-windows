@@ -241,13 +241,16 @@ if (-not $claudeExe) {
     exit 1
 }
 
+$outLog = Join-Path $env:TEMP "claude_app_out.log"
+$errLog = Join-Path $env:TEMP "claude_app_err.log"
+
 Write-Host "`n[*] Launching Claude Desktop instance: $($best.InstanceName)..." -ForegroundColor Cyan
 if (Test-IsDefaultInstance $best.InstanceName) {
-    Start-Process -FilePath $claudeExe
+    Start-Process -FilePath $claudeExe -RedirectStandardOutput $outLog -RedirectStandardError $errLog
     Write-Host "[+] Claude Desktop launched (default instance)" -ForegroundColor Green
 } else {
     $instanceDir = Join-Path $INSTANCES_BASE $best.InstanceName
-    Start-Process -FilePath $claudeExe -ArgumentList "--user-data-dir=`"$instanceDir`""
+    Start-Process -FilePath $claudeExe -ArgumentList "--user-data-dir=`"$instanceDir`"" -RedirectStandardOutput $outLog -RedirectStandardError $errLog
     Write-Host "[+] Claude Desktop launched (instance: $($best.InstanceName))" -ForegroundColor Green
     Write-Host "    Data Dir: $instanceDir" -ForegroundColor Gray
 }

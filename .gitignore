@@ -1,0 +1,12 @@
+# Local instance data directory if run inside repo
+.claude-instances/
+claude_exe_path.txt
+
+# Windows OS metadata
+Thumbs.db
+Desktop.ini
+$RECYCLE.BIN/
+
+# VS Code & IDE files
+.vscode/
+.idea/

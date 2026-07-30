@@ -81,14 +81,15 @@ every time `auto` is run (`.\claude_quick.ps1 auto` or `.\claude_auto_select.ps1
 ---
 ## creating new instance
 
-- you may need to point the program to claude.exe
-- once thats done, a fresh instance will be created, ready for you to sign in 
+- point the program to `Claude.exe` if not detected automatically.
+- a fresh isolated instance directory will be created, and Desktop shortcut options will be prompted before launch.
+- the script automatically suppresses Electron pre-authentication background warnings (such as `Error: No active account context`) so your console remains clean.
+
 ---
 
 ## signing in from browser
 
-- close any running instances from the taskbar
-- you may see an OTP code on your default claude
+- close any running instances when prompted so the browser OAuth callback (`claude://`) routes directly to your newly launched instance.
 - once signed in, session tokens remain saved in that instance's folder (`~/.claude-instances/<name>`) and will stay logged in independently.
 
 ---
