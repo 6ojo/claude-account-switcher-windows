@@ -48,7 +48,35 @@ function Get-ClaudeExePath {
         }
     }
 
-    # Search WindowsApps (MSIX/Store installation)
+    # Windows Store / MSIX installation.
+    # Note: recursively searching $env:ProgramFiles\WindowsApps returns nothing for a
+    # non-elevated user, because the directory ACL denies enumeration. Direct path access
+    # to the same files works fine, so resolve the install location instead of searching.
+    try {
+        foreach ($pkg in (Get-AppxPackage -Name "*Claude*" -ErrorAction SilentlyContinue)) {
+            if (-not $pkg.InstallLocation) { continue }
+            foreach ($rel in @("app\Claude.exe", "Claude.exe")) {
+                $msixExe = Join-Path $pkg.InstallLocation $rel
+                if (Test-Path $msixExe) {
+                    return $msixExe
+                }
+            }
+        }
+    } catch {}
+
+    # Claude registers itself as the claude:// protocol handler on every launch, so this
+    # key holds the exe path of whichever build is installed (including MSIX).
+    try {
+        $handler = (Get-ItemProperty -Path "Registry::HKEY_CLASSES_ROOT\claude\shell\open\command" -ErrorAction SilentlyContinue).'(default)'
+        if ($handler -and $handler -match '^"([^"]+\.exe)"') {
+            $handlerExe = $Matches[1]
+            if (Test-Path $handlerExe) {
+                return $handlerExe
+            }
+        }
+    } catch {}
+
+    # Last resort: enumerate WindowsApps. Only succeeds when running elevated.
     $winAppsClaude = Get-ChildItem -Path "$env:ProgramFiles\WindowsApps" -Filter "claude.exe" -Recurse -Depth 3 -ErrorAction SilentlyContinue | Select-Object -ExpandProperty FullName -First 1
     if ($winAppsClaude -and (Test-Path $winAppsClaude)) {
         return $winAppsClaude
@@ -118,12 +146,78 @@ function Test-IsDefaultInstance ($name) {
     return ($name -eq "default")
 }
 
+# Numbered picker over instances that actually exist on disk. Returns $null if cancelled.
+function Select-ExistingInstance ($promptLabel) {
+    if (-not $promptLabel) { $promptLabel = "Select instance" }
+
+    $options = @("default") + (Get-InstanceList)
+
+    Write-Host "`nClaude Desktop Instances" -ForegroundColor Cyan
+    Write-Host "========================" -ForegroundColor Cyan
+    Write-Host ""
+    for ($i = 0; $i -lt $options.Count; $i++) {
+        $label = if (Test-IsDefaultInstance $options[$i]) { "default (built-in default data directory)" } else { $options[$i] }
+        Write-Host ("  {0}. {1}" -f ($i + 1), $label)
+    }
+    Write-Host ""
+    Write-Host "  0. Cancel" -ForegroundColor Gray
+    Write-Host ""
+
+    $raw = (Read-Host "$promptLabel (0-$($options.Count))").Trim()
+    if ($raw -eq "0" -or $raw -eq "") { return $null }
+
+    $index = 0
+    if (-not [int]::TryParse($raw, [ref]$index) -or $index -lt 1 -or $index -gt $options.Count) {
+        Write-Host "[X] '$raw' is not one of the listed numbers." -ForegroundColor Red
+        return $null
+    }
+
+    return $options[$index - 1]
+}
+
+$RESERVED_DEVICE_NAMES = @(
+    "CON","PRN","AUX","NUL",
+    "COM1","COM2","COM3","COM4","COM5","COM6","COM7","COM8","COM9",
+    "LPT1","LPT2","LPT3","LPT4","LPT5","LPT6","LPT7","LPT8","LPT9"
+)
+
+# Read-Host returns whatever was typed, including stray whitespace. An instance name with a
+# leading space resolves to a DIFFERENT directory than the same name without it, which makes
+# Claude launch against an empty profile. Always run user input through this.
+function Get-CleanInstanceName ($name) {
+    if ($null -eq $name) { return "" }
+    return $name.Trim()
+}
+
 function Test-ValidInstanceName ($name) {
     if (-not $name) { return $false }
-    if ($name -match '[\\/:*?"<>|]' -or $name -eq "." -or $name -eq "..") {
-        return $false
-    }
+
+    # Reject anything that would be silently rewritten or would resolve elsewhere.
+    if ($name -ne $name.Trim()) { return $false }
+    if ($name -match '[\\/:*?"<>|]') { return $false }
+    if ($name -match '[\x00-\x1f]') { return $false }
+    if ($name -match '^\.+$') { return $false }
+    if ($name.EndsWith(".")) { return $false }
+    if ($name.Length -gt 64) { return $false }
+    if ($RESERVED_DEVICE_NAMES -contains $name.ToUpper()) { return $false }
+
     return $true
+}
+
+function Test-InstanceExists ($instanceName) {
+    if (Test-IsDefaultInstance $instanceName) { return $true }
+    if (-not $instanceName) { return $false }
+    return (Test-Path (Join-Path $INSTANCES_BASE $instanceName) -PathType Container)
+}
+
+# Returns the instance name as it is spelled on disk, so "LANGE" resolves to "Lange".
+# Windows paths are case-insensitive but the display should match reality.
+function Resolve-InstanceName ($instanceName) {
+    if (Test-IsDefaultInstance $instanceName) { return "default" }
+    foreach ($existing in (Get-InstanceList)) {
+        if ($existing -eq $instanceName) { return $existing }
+    }
+    return $instanceName
 }
 
 function Create-DesktopShortcut ($instanceName, $displayName) {
@@ -167,19 +261,46 @@ function Create-DesktopShortcut ($instanceName, $displayName) {
     Write-Host "[+] Shortcut created on Desktop: $shortcutPath" -ForegroundColor Green
 }
 
-function Test-ClaudeIsRunning {
+# The Claude Code CLI binary is ALSO named claude.exe, and it installs itself inside instance
+# data directories (e.g. ~\.claude-instances\<name>\claude-code\<ver>\claude.exe). Matching on
+# process name alone therefore selects running Claude Code sessions as well, and force-killing
+# those destroys the user's in-progress work.
+#
+# This deliberately errs toward missing a Claude Desktop process rather than ever selecting
+# something else: a process is only returned when its executable path is readable AND matches
+# the resolved Claude Desktop executable.
+function Get-ClaudeDesktopProcesses {
+    $desktopExe = Get-ClaudeExePath
+    if (-not $desktopExe) { return @() }
+
     $procs = Get-Process -Name "claude" -ErrorAction SilentlyContinue
-    return ($null -ne $procs -and $procs.Count -gt 0)
+    if (-not $procs) { return @() }
+
+    $matched = foreach ($p in $procs) {
+        $procPath = try { $p.Path } catch { $null }
+        if (-not $procPath) { continue }
+        if ($procPath -like "*\claude-code\*") { continue }
+        if ($procPath -eq $desktopExe) { $p }
+    }
+
+    return @($matched)
+}
+
+function Test-ClaudeIsRunning {
+    return ((Get-ClaudeDesktopProcesses).Count -gt 0)
 }
 
 function Stop-ClaudeProcesses {
-    $procs = Get-Process -Name "claude" -ErrorAction SilentlyContinue
-    if ($procs) {
-        Write-Host "[*] Stopping running Claude Desktop processes..." -ForegroundColor Yellow
-        Stop-Process -Name "claude" -Force -ErrorAction SilentlyContinue
-        Start-Sleep -Seconds 1
-        Write-Host "[+] Running Claude Desktop processes stopped." -ForegroundColor Green
+    $procs = Get-ClaudeDesktopProcesses
+    if ($procs.Count -eq 0) { return }
+
+    Write-Host "[*] Stopping $($procs.Count) running Claude Desktop process(es)..." -ForegroundColor Yellow
+    foreach ($p in $procs) {
+        Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue
     }
+    Start-Sleep -Seconds 1
+    Write-Host "[+] Running Claude Desktop processes stopped." -ForegroundColor Green
+    Write-Host "    (Claude Code CLI sessions were left untouched.)" -ForegroundColor Gray
 }
 
 function Confirm-CloseRunningClaude ($contextMsg) {
@@ -188,19 +309,44 @@ function Confirm-CloseRunningClaude ($contextMsg) {
         if ($contextMsg) {
             Write-Host "    $contextMsg" -ForegroundColor Yellow
         }
-        Write-Host "    Closing existing instances ensures browser SSO sign-in links (claude://) route to the target account." -ForegroundColor Yellow
-        $stopConfirm = Read-Host "Close existing running Claude processes now? (Y/n)"
+        Write-Host "    Closing it avoids two instances competing for the same window focus." -ForegroundColor Yellow
+        Write-Host "    Note: this does NOT redirect browser sign-in links. Claude re-registers itself" -ForegroundColor Yellow
+        Write-Host "    as the claude:// handler on every launch, so those links land in the default" -ForegroundColor Yellow
+        Write-Host "    profile regardless. Copy the sign-in code and paste it into the target window." -ForegroundColor Yellow
+        $stopConfirm = Read-Host "Close running Claude Desktop processes now? (Y/n)"
         if ($stopConfirm -notmatch '^[Nn]$') {
             Stop-ClaudeProcesses
         }
     }
 }
 
-function Launch-Instance ($instanceName) {
+function Launch-Instance ($instanceName, [switch]$AllowCreate) {
+    $instanceName = Get-CleanInstanceName $instanceName
+
     if (-not (Test-ValidInstanceName $instanceName)) {
-        Write-Host "[X] Invalid instance name. Do not use path separators or special characters." -ForegroundColor Red
+        Write-Host "[X] Invalid instance name: '$instanceName'" -ForegroundColor Red
+        Write-Host "    Avoid path separators, special characters, leading/trailing spaces," -ForegroundColor Gray
+        Write-Host "    reserved device names (CON, PRN, AUX, NUL, COM1-9, LPT1-9), and names over 64 chars." -ForegroundColor Gray
         return
     }
+
+    # Launching an instance must never silently create one. Passing a name that does not exist
+    # (a typo, a stray space, a name that only differs by whitespace) used to create a fresh
+    # empty data directory and start Claude against it, which presents as a signed-out
+    # "wiped" profile with no indication that anything went wrong.
+    if (-not (Test-InstanceExists $instanceName)) {
+        if (-not $AllowCreate) {
+            Write-Host "[X] Instance '$instanceName' does not exist." -ForegroundColor Red
+            Write-Host "    Launching it would start Claude against an empty profile (signed out, no history)." -ForegroundColor Yellow
+            Write-Host ""
+            List-Instances
+            Write-Host "    To create a new instance, use menu option 4." -ForegroundColor Gray
+            return
+        }
+        Write-Host "[*] Creating new instance '$instanceName'." -ForegroundColor Cyan
+    }
+
+    $instanceName = Resolve-InstanceName $instanceName
 
     $claudeExe = Ensure-ClaudeExe
 
@@ -229,9 +375,11 @@ function Launch-Instance ($instanceName) {
 
 function Delete-Instance ($instanceName) {
     if (-not $instanceName) {
-        List-Instances
-        $instanceName = Read-Host "Instance name to delete"
+        $instanceName = Select-ExistingInstance "Instance to delete"
+        if (-not $instanceName) { return }
     }
+
+    $instanceName = Get-CleanInstanceName $instanceName
 
     if (-not (Test-ValidInstanceName $instanceName)) {
         Write-Host "[X] Invalid instance name." -ForegroundColor Red
@@ -519,8 +667,9 @@ switch ($cmdLower) {
     }
     "shortcut" {
         if (-not $Name) {
-            List-Instances
-            $Name = Read-Host "Instance name for shortcut"
+            $Name = Select-ExistingInstance "Instance for shortcut"
+        } else {
+            $Name = Get-CleanInstanceName $Name
         }
         if ($Name) {
             Create-DesktopShortcut $Name
@@ -554,8 +703,9 @@ do {
     Write-Host "8. Diagnostics"
     Write-Host "9. Exit"
     Write-Host ""
-    Write-Host "Tip: When logging into a new instance for the first time via browser SSO," -ForegroundColor Yellow
-    Write-Host "     keep other Claude instances closed so the callback opens in the active instance." -ForegroundColor Yellow
+    Write-Host "Tip: Browser sign-in links (claude://) always open the DEFAULT profile, because" -ForegroundColor Yellow
+    Write-Host "     Claude re-registers itself as the claude:// handler on every launch. When" -ForegroundColor Yellow
+    Write-Host "     signing into a new instance, copy the code and paste it into that window." -ForegroundColor Yellow
     Write-Host ""
     $choice = Read-Host "Select (1-9)"
 
@@ -569,8 +719,9 @@ do {
             $loop = $false
         }
         "3" {
-            List-Instances
-            $n = Read-Host "Instance name"
+            # Pick by number rather than retyping the name. Retyping is how a stray space or a
+            # typo turns into a launch against a brand-new empty profile.
+            $n = Select-ExistingInstance
             if ($n) {
                 Confirm-CloseRunningClaude "Switching instance."
                 Launch-Instance $n
@@ -578,11 +729,17 @@ do {
             }
         }
         "4" {
-            $n = Read-Host "New instance name"
+            $n = Get-CleanInstanceName (Read-Host "New instance name")
             if (-not $n) {
                 Write-Host "[X] No name provided." -ForegroundColor Red
             } elseif (Test-IsDefaultInstance $n) {
                 Write-Host "[X] 'default' is reserved for the built-in instance." -ForegroundColor Red
+            } elseif (-not (Test-ValidInstanceName $n)) {
+                Write-Host "[X] Invalid instance name: '$n'" -ForegroundColor Red
+                Write-Host "    Avoid path separators, special characters, reserved device names, and names over 64 chars." -ForegroundColor Gray
+            } elseif (Test-InstanceExists $n) {
+                Write-Host "[!] Instance '$(Resolve-InstanceName $n)' already exists." -ForegroundColor Yellow
+                Write-Host "    Use option 3 to launch it. Nothing was changed." -ForegroundColor Gray
             } else {
                 $createSc = Read-Host "Create a Desktop shortcut for '$n'? (Y/n)"
                 if ($createSc -notmatch '^[Nn]$') {
@@ -590,7 +747,7 @@ do {
                 }
                 Confirm-CloseRunningClaude "Creating and logging into a new instance."
                 Write-Host "`n[*] Starting new instance '$n'. Complete sign-in in the launched window." -ForegroundColor Cyan
-                Launch-Instance $n
+                Launch-Instance $n -AllowCreate
                 $loop = $false
             }
         }
@@ -607,8 +764,7 @@ do {
             $loop = $true
         }
         "7" {
-            List-Instances
-            $n = Read-Host "Instance name for shortcut"
+            $n = Select-ExistingInstance "Instance for shortcut"
             if ($n) { Create-DesktopShortcut $n }
             Write-Host ""
             Read-Host "Press Enter to continue..."

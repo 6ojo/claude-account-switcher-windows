@@ -54,6 +54,35 @@ function Get-ClaudeExePath {
         }
     }
 
+    # Windows Store / MSIX installation.
+    # Note: recursively searching $env:ProgramFiles\WindowsApps returns nothing for a
+    # non-elevated user, because the directory ACL denies enumeration. Direct path access
+    # to the same files works fine, so resolve the install location instead of searching.
+    try {
+        foreach ($pkg in (Get-AppxPackage -Name "*Claude*" -ErrorAction SilentlyContinue)) {
+            if (-not $pkg.InstallLocation) { continue }
+            foreach ($rel in @("app\Claude.exe", "Claude.exe")) {
+                $msixExe = Join-Path $pkg.InstallLocation $rel
+                if (Test-Path $msixExe) {
+                    return $msixExe
+                }
+            }
+        }
+    } catch {}
+
+    # Claude registers itself as the claude:// protocol handler on every launch, so this
+    # key holds the exe path of whichever build is installed (including MSIX).
+    try {
+        $handler = (Get-ItemProperty -Path "Registry::HKEY_CLASSES_ROOT\claude\shell\open\command" -ErrorAction SilentlyContinue).'(default)'
+        if ($handler -and $handler -match '^"([^"]+\.exe)"') {
+            $handlerExe = $Matches[1]
+            if (Test-Path $handlerExe) {
+                return $handlerExe
+            }
+        }
+    } catch {}
+
+    # Last resort: enumerate WindowsApps. Only succeeds when running elevated.
     $winAppsClaude = Get-ChildItem -Path "$env:ProgramFiles\WindowsApps" -Filter "claude.exe" -Recurse -Depth 3 -ErrorAction SilentlyContinue | Select-Object -ExpandProperty FullName -First 1
     if ($winAppsClaude -and (Test-Path $winAppsClaude)) {
         return $winAppsClaude
